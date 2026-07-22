@@ -83,8 +83,8 @@
   .drag-hint{font-size:12.5px;color:var(--muted);margin-bottom:10px;text-align:center;}
 
   .teams-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;}
-  .team-card{border:1px solid;border-radius:12px;overflow:hidden;min-height:140px;display:flex;flex-direction:column;}
-  .team-header{padding:9px 12px;font-family:'Oswald',sans-serif;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center;}
+  .team-card{border:1px solid var(--panel-border);border-radius:12px;overflow:hidden;min-height:140px;display:flex;flex-direction:column;background:var(--panel);}
+  .team-header{padding:9px 12px;font-family:'Oswald',sans-serif;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center;background:var(--panel-border);color:var(--text);gap:6px;}
   .team-count{font-family:'JetBrains Mono',monospace;font-size:12px;opacity:.85;}
   .team-body{padding:10px;display:flex;flex-direction:column;gap:6px;flex:1;}
   .team-empty{color:#5C7285;font-size:13px;text-align:center;padding:10px 0;}
@@ -100,15 +100,6 @@
 <script>
 /* ===== Teamteiler — eigenständige Version für GitHub Pages ===== */
 
-const LEIBCHEN = [
-  { name: "Rot", bg: "#C8442C", bgSoft: "#3A2420", text: "#FDEEE8" },
-  { name: "Blau", bg: "#2C6E9E", bgSoft: "#1E2E3A", text: "#E9F3FB" },
-  { name: "Gelb", bg: "#D9A427", bgSoft: "#3A3320", text: "#FBF3DC" },
-  { name: "Grün", bg: "#3E8B5C", bgSoft: "#213A2A", text: "#E7F6ED" },
-  { name: "Lila", bg: "#7C5FA6", bgSoft: "#2C2438", text: "#F1EBF9" },
-  { name: "Orange", bg: "#D9762A", bgSoft: "#3A2A1B", text: "#FCEADC" },
-];
-
 const uid = () => Math.random().toString(36).slice(2, 10);
 const STORAGE_KEY = "teamteiler-classes";
 
@@ -119,12 +110,24 @@ let state = {
   view: "roster", // roster | generate
   newName: "",
   newSkill: 3,
+  bulkMode: false,
+  bulkText: "",
   editingClassName: false,
   showClassPicker: false,
   numTeams: 4,
+  studentsPerTeam: 4,
+  sizeMode: "teams", // teams | perTeam
   mode: "balanced", // random | balanced | stacked
   teams: null,
+  teamsWarning: null,
+  editingTeamId: null,
   excluded: {}, // studentId -> true
+  pickCount: 3,
+  pickNoRepeat: true,
+  pickedIds: {},
+  pickResult: null,
+  tourFormat: "roundrobin", // roundrobin | knockout | groups
+  tourFields: 1,
 };
 
 function loadState() {
@@ -156,7 +159,7 @@ function getActiveClass() {
 
 // ---- Actions ----
 function createClass() {
-  const c = { id: uid(), name: `Klasse ${state.classes.length + 1}`, students: [] };
+  const c = { id: uid(), name: `Klasse ${state.classes.length + 1}`, students: [], rules: { together: [], apart: [] } };
   state.classes.push(c);
   state.activeClassId = c.id;
   state.view = "roster";
@@ -193,6 +196,20 @@ function addStudent() {
   render();
 }
 
+function addBulkStudents() {
+  const c = getActiveClass();
+  if (!c) return;
+  const names = state.bulkText
+    .split(/[\n,]+/)
+    .map(n => n.trim())
+    .filter(n => n.length > 0);
+  if (names.length === 0) return;
+  names.forEach(name => c.students.push({ id: uid(), name, skill: 3 }));
+  state.bulkText = "";
+  saveState();
+  render();
+}
+
 function removeStudent(id) {
   const c = getActiveClass();
   if (!c) return;
@@ -216,36 +233,296 @@ function toggleExcluded(id) {
   render();
 }
 
+function addRule(type, idA, idB) {
+  if (!idA || !idB || idA === idB) return;
+  const c = getActiveClass();
+  if (!c) return;
+  if (!c.rules) c.rules = { together: [], apart: [] };
+  const list = c.rules[type];
+  const exists = list.some(([a, b]) => (a === idA && b === idB) || (a === idB && b === idA));
+  if (!exists) list.push([idA, idB]);
+  saveState();
+  render();
+}
+
+function removeRule(type, index) {
+  const c = getActiveClass();
+  if (!c || !c.rules) return;
+  c.rules[type].splice(index, 1);
+  saveState();
+  render();
+}
+
+function pickRandom() {
+  const c = getActiveClass();
+  if (!c) return;
+  const present = c.students.filter(s => !state.excluded[s.id]);
+  let candidates = state.pickNoRepeat ? present.filter(s => !state.pickedIds[s.id]) : present;
+  if (state.pickNoRepeat && candidates.length < state.pickCount) {
+    // Nicht mehr genug übrig — Runde ist durch, alle wieder zulassen
+    state.pickedIds = {};
+    candidates = present;
+  }
+  const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+  const picked = shuffled.slice(0, Math.min(state.pickCount, shuffled.length));
+  picked.forEach(s => { state.pickedIds[s.id] = true; });
+  state.pickResult = picked;
+  render();
+}
+
+function resetPicked() {
+  state.pickedIds = {};
+  state.pickResult = null;
+  render();
+}
+
+// ---- Turnier ----
+
+function buildRoundRobinRounds(teamIds, fieldsCount) {
+  const pairs = [];
+  for (let i = 0; i < teamIds.length; i++) {
+    for (let j = i + 1; j < teamIds.length; j++) pairs.push([teamIds[i], teamIds[j]]);
+  }
+  pairs.sort(() => Math.random() - 0.5);
+  const rounds = [];
+  for (let i = 0; i < pairs.length; i += fieldsCount) {
+    rounds.push(pairs.slice(i, i + fieldsCount).map(([a, b]) => ({ id: uid(), teamA: a, teamB: b, winner: null, bye: false, scoreA: null, scoreB: null })));
+  }
+  return rounds;
+}
+
+function buildKnockoutFirstRound(teamIds) {
+  const shuffled = [...teamIds].sort(() => Math.random() - 0.5);
+  let size = 1;
+  while (size < shuffled.length) size *= 2;
+  const byesNeeded = size - shuffled.length;
+  const byeTeams = shuffled.slice(0, byesNeeded);
+  const playTeams = shuffled.slice(byesNeeded);
+  const matches = [];
+  byeTeams.forEach(t => matches.push({ id: uid(), teamA: t, teamB: null, winner: t, bye: true, scoreA: null, scoreB: null }));
+  for (let i = 0; i < playTeams.length; i += 2) {
+    matches.push({ id: uid(), teamA: playTeams[i], teamB: playTeams[i + 1], winner: null, bye: false, scoreA: null, scoreB: null });
+  }
+  return matches;
+}
+
+function buildNextKnockoutRound(prevMatches) {
+  const winners = prevMatches.map(m => m.winner);
+  if (winners.length <= 1) return null;
+  const matches = [];
+  for (let i = 0; i < winners.length; i += 2) {
+    matches.push({ id: uid(), teamA: winners[i], teamB: winners[i + 1], winner: null, bye: false, scoreA: null, scoreB: null });
+  }
+  return matches;
+}
+
+function updateWinnerFromScore(m) {
+  if (m.scoreA !== null && m.scoreA !== undefined && m.scoreB !== null && m.scoreB !== undefined) {
+    if (m.scoreA > m.scoreB) m.winner = m.teamA;
+    else if (m.scoreB > m.scoreA) m.winner = m.teamB;
+    else m.winner = null;
+  } else {
+    m.winner = null;
+  }
+}
+
+function tryAdvanceKnockout(koRounds) {
+  const last = koRounds[koRounds.length - 1];
+  const allDecided = last.every(m => m.winner !== null && m.winner !== undefined);
+  if (!allDecided || last.length <= 1) return;
+  const next = buildNextKnockoutRound(last);
+  if (next) koRounds.push(next);
+}
+
+function computeStandings(teamIds, rounds) {
+  const stats = {};
+  teamIds.forEach(id => { stats[id] = { id, wins: 0, draws: 0, losses: 0, gf: 0, ga: 0, points: 0 }; });
+  rounds.forEach(round => round.forEach(m => {
+    if (m.bye || m.teamB == null) return;
+    if (m.scoreA == null || m.scoreB == null) return;
+    if (stats[m.teamA] === undefined || stats[m.teamB] === undefined) return;
+    stats[m.teamA].gf += m.scoreA; stats[m.teamA].ga += m.scoreB;
+    stats[m.teamB].gf += m.scoreB; stats[m.teamB].ga += m.scoreA;
+    if (m.scoreA > m.scoreB) { stats[m.teamA].wins++; stats[m.teamA].points += 3; stats[m.teamB].losses++; }
+    else if (m.scoreB > m.scoreA) { stats[m.teamB].wins++; stats[m.teamB].points += 3; stats[m.teamA].losses++; }
+    else { stats[m.teamA].draws++; stats[m.teamB].draws++; stats[m.teamA].points++; stats[m.teamB].points++; }
+  }));
+  return Object.values(stats).sort((a, b) => b.points - a.points || (b.gf - b.ga) - (a.gf - a.ga) || b.gf - a.gf);
+}
+
+function startTournament() {
+  const c = getActiveClass();
+  if (!c || !state.teams || state.teams.length < 2) return;
+  const teamIds = state.teams.map(t => t.id);
+  const teamNames = {};
+  state.teams.forEach(t => { teamNames[t.id] = t.name; });
+  const fieldsCount = Math.max(1, state.tourFields);
+  const tournament = { format: state.tourFormat, fieldsCount, teamIds, teamNames };
+
+  if (state.tourFormat === "roundrobin") {
+    tournament.rounds = buildRoundRobinRounds(teamIds, fieldsCount);
+  } else if (state.tourFormat === "knockout") {
+    tournament.koRounds = [buildKnockoutFirstRound(teamIds)];
+  } else if (state.tourFormat === "groups") {
+    const shuffled = [...teamIds].sort(() => Math.random() - 0.5);
+    const groupA = [], groupB = [];
+    shuffled.forEach((id, idx) => (idx % 2 === 0 ? groupA : groupB).push(id));
+    tournament.groups = [
+      { teamIds: groupA, rounds: buildRoundRobinRounds(groupA, fieldsCount) },
+      { teamIds: groupB, rounds: buildRoundRobinRounds(groupB, fieldsCount) },
+    ];
+    tournament.koFromGroups = null;
+  }
+  c.tournament = tournament;
+  saveState();
+  render();
+}
+
+function startKnockoutFromGroups() {
+  const c = getActiveClass();
+  if (!c || !c.tournament) return;
+  const t = c.tournament;
+  const standingsA = computeStandings(t.groups[0].teamIds, t.groups[0].rounds);
+  const standingsB = computeStandings(t.groups[1].teamIds, t.groups[1].rounds);
+  const a1 = standingsA[0].id;
+  const a2 = standingsA[1] ? standingsA[1].id : standingsA[0].id;
+  const b1 = standingsB[0].id;
+  const b2 = standingsB[1] ? standingsB[1].id : standingsB[0].id;
+  t.koFromGroups = [[
+    { id: uid(), teamA: a1, teamB: b2, winner: null, bye: false },
+    { id: uid(), teamA: b1, teamB: a2, winner: null, bye: false },
+  ]];
+  saveState();
+  render();
+}
+
+function resetTournament() {
+  const c = getActiveClass();
+  if (!c) return;
+  delete c.tournament;
+  saveState();
+  render();
+}
+
+// Fasst Schüler:innen, die per "Immer zusammen"-Regel verbunden sind, zu einer
+// gemeinsamen Einheit zusammen, damit sie bei der Aufteilung nie getrennt werden.
+function buildUnits(pool, togetherPairs) {
+  const parent = {};
+  pool.forEach(s => { parent[s.id] = s.id; });
+  function find(x) { while (parent[x] !== x) x = parent[x]; return x; }
+  function union(a, b) { const ra = find(a), rb = find(b); if (ra !== rb) parent[ra] = rb; }
+  togetherPairs.forEach(([a, b]) => {
+    if (parent[a] !== undefined && parent[b] !== undefined) union(a, b);
+  });
+  const groups = {};
+  pool.forEach(s => {
+    const root = find(s.id);
+    (groups[root] = groups[root] || []).push(s);
+  });
+  return Object.values(groups).map(students => ({
+    ids: students.map(s => s.id),
+    students,
+    skill: students.reduce((sum, s) => sum + s.skill, 0) / students.length,
+  }));
+}
+
+function renameTeam(teamId, name) {
+  if (!state.teams) return;
+  const team = state.teams.find(t => t.id === teamId);
+  if (team) team.name = name.trim() || `Team ${teamId + 1}`;
+  render();
+}
+
 function generateTeams() {
   const c = getActiveClass();
   if (!c) return;
+  const rules = c.rules || { together: [], apart: [] };
   const pool = c.students.filter(s => !state.excluded[s.id]);
-  const n = Math.max(2, Math.min(state.numTeams, LEIBCHEN.length, pool.length || 2));
-  const slots = Array.from({ length: n }, (_, i) => ({ id: i, students: [] }));
+  const poolIds = new Set(pool.map(s => s.id));
+  const togetherPairs = rules.together.filter(([a, b]) => poolIds.has(a) && poolIds.has(b));
+  const apartPairs = rules.apart.filter(([a, b]) => poolIds.has(a) && poolIds.has(b));
+
+  const desiredTeams = state.sizeMode === "perTeam"
+    ? Math.max(2, Math.ceil((pool.length || 1) / state.studentsPerTeam))
+    : state.numTeams;
+  const n = Math.max(2, Math.min(desiredTeams, pool.length || 2));
+  const slots = Array.from({ length: n }, (_, i) => ({ id: i, name: `Team ${i + 1}`, students: [] }));
+
+  const units = buildUnits(pool, togetherPairs);
 
   if (state.mode === "random") {
-    const shuffled = [...pool].sort(() => Math.random() - 0.5);
-    shuffled.forEach((s, i) => slots[i % n].students.push(s));
+    const shuffled = [...units].sort(() => Math.random() - 0.5);
+    shuffled.forEach(u => {
+      const target = slots.reduce((min, s) => (s.students.length < min.students.length ? s : min), slots[0]);
+      target.students.push(...u.students);
+    });
   } else if (state.mode === "balanced") {
-    const sorted = [...pool].sort((a, b) => b.skill - a.skill);
+    const sorted = [...units].sort((a, b) => b.skill - a.skill);
     let i = 0, dir = 1;
-    for (const s of sorted) {
-      slots[i].students.push(s);
+    for (const u of sorted) {
+      slots[i].students.push(...u.students);
       if (dir === 1 && i === n - 1) dir = -1;
       else if (dir === -1 && i === 0) dir = 1;
       else i += dir;
     }
   } else if (state.mode === "stacked") {
-    const sorted = [...pool].sort((a, b) => b.skill - a.skill);
-    const base = Math.floor(sorted.length / n);
-    const extra = sorted.length % n;
-    let idx = 0;
-    for (let t = 0; t < n; t++) {
-      const count = base + (t < extra ? 1 : 0);
-      slots[t].students = sorted.slice(idx, idx + count);
-      idx += count;
-    }
+    const sorted = [...units].sort((a, b) => b.skill - a.skill);
+    const base = Math.floor(pool.length / n);
+    const extra = pool.length % n;
+    let slotIdx = 0;
+    let capacity = base + (slotIdx < extra ? 1 : 0);
+    sorted.forEach(u => {
+      if (slots[slotIdx].students.length >= capacity && slotIdx < n - 1) {
+        slotIdx++;
+        capacity = base + (slotIdx < extra ? 1 : 0);
+      }
+      slots[slotIdx].students.push(...u.students);
+    });
   }
+
+  // "Nie zusammen"-Regeln reparieren: verletzte Paare in andere Teams verschieben
+  const idToUnit = {};
+  units.forEach(u => u.ids.forEach(id => { idToUnit[id] = u; }));
+
+  function slotMap() {
+    const map = {};
+    slots.forEach(s => s.students.forEach(st => { map[st.id] = s; }));
+    return map;
+  }
+
+  for (let pass = 0; pass < 6; pass++) {
+    const slotOf = slotMap();
+    let changed = false;
+    for (const [a, b] of apartPairs) {
+      if (!slotOf[a] || !slotOf[b] || slotOf[a] !== slotOf[b]) continue;
+      const unitB = idToUnit[b];
+      const currentSlot = slotOf[b];
+      const candidates = slots
+        .filter(s => s !== currentSlot)
+        .sort((x, y) => x.students.length - y.students.length);
+      for (const cand of candidates) {
+        const conflict = unitB.ids.some(uid =>
+          cand.students.some(st =>
+            apartPairs.some(([x, y]) => (x === uid && y === st.id) || (y === uid && x === st.id))
+          )
+        );
+        if (!conflict) {
+          currentSlot.students = currentSlot.students.filter(st => !unitB.ids.includes(st.id));
+          cand.students.push(...unitB.students);
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) break;
+  }
+
+  const finalSlotOf = slotMap();
+  const stillViolated = apartPairs.filter(([a, b]) => finalSlotOf[a] && finalSlotOf[b] && finalSlotOf[a] === finalSlotOf[b]).length;
+  state.teamsWarning = stillViolated > 0
+    ? `${stillViolated} "Nie zusammen"-Regel(n) konnten nicht eingehalten werden — zu viele Einschränkungen gleichzeitig.`
+    : null;
+
   state.teams = slots;
   render();
 }
@@ -334,7 +611,16 @@ function renderHeader() {
   const dropdown = el("div", { class: "class-dropdown" + (state.showClassPicker ? " open" : "") });
   state.classes.forEach(c => {
     const item = el("div", { class: "class-dropdown-item", style: c.id === state.activeClassId ? "background:#2A3F4E" : "" });
-    const nameSpan = el("span", { class: "name", onClick: () => { state.activeClassId = c.id; state.teams = null; state.showClassPicker = false; saveState(); render(); } },
+    const nameSpan = el("span", { class: "name", onClick: () => {
+      state.activeClassId = c.id;
+      state.teams = null;
+      state.teamsWarning = null;
+      state.pickedIds = {};
+      state.pickResult = null;
+      state.showClassPicker = false;
+      saveState();
+      render();
+    } },
       `${c.name} `);
     nameSpan.appendChild(el("span", { class: "count" }, `(${c.students.length})`));
     item.appendChild(nameSpan);
@@ -385,7 +671,10 @@ function renderSubHeader(activeClass) {
 
   const tabs = el("div", { class: "tab-row" }, [
     el("button", { class: "tab" + (state.view === "roster" ? " active" : ""), onClick: () => { state.view = "roster"; render(); } }, "Schüler:innen"),
+    el("button", { class: "tab" + (state.view === "rules" ? " active" : ""), onClick: () => { state.view = "rules"; render(); } }, "Regeln"),
     el("button", { class: "tab" + (state.view === "generate" ? " active" : ""), onClick: () => { state.view = "generate"; render(); } }, "Teams bilden"),
+    el("button", { class: "tab" + (state.view === "pick" ? " active" : ""), onClick: () => { state.view = "pick"; render(); } }, "Auswahl"),
+    el("button", { class: "tab" + (state.view === "tournament" ? " active" : ""), onClick: () => { state.view = "tournament"; render(); } }, "Turnier"),
   ]);
   wrap.appendChild(tabs);
   return wrap;
@@ -394,14 +683,37 @@ function renderSubHeader(activeClass) {
 function renderRosterView(activeClass) {
   const wrap = el("div", { class: "content" });
 
-  const addRow = el("div", { class: "add-row" });
-  const nameInput = el("input", { class: "text-input", placeholder: "Name eintragen …", value: state.newName });
-  nameInput.addEventListener("input", (e) => { state.newName = e.target.value; });
-  nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") addStudent(); });
-  addRow.appendChild(nameInput);
-  addRow.appendChild(starsEl(state.newSkill, 15, (n) => { state.newSkill = n; render(); setTimeout(() => nameInput.focus(), 0); }));
-  addRow.appendChild(el("button", { class: "btn-primary-sm", onClick: addStudent }, "+ Hinzufügen"));
-  wrap.appendChild(addRow);
+  const toggleRow = el("div", { class: "mode-row", style: "margin-bottom:12px" }, [
+    el("button", { class: "mode-btn" + (!state.bulkMode ? " active" : ""), onClick: () => { state.bulkMode = false; render(); } }, "Einzeln"),
+    el("button", { class: "mode-btn" + (state.bulkMode ? " active" : ""), onClick: () => { state.bulkMode = true; render(); } }, "Mehrere auf einmal"),
+  ]);
+  wrap.appendChild(toggleRow);
+
+  if (state.bulkMode) {
+    const textarea = el("textarea", {
+      class: "text-input",
+      style: "width:100%;min-height:120px;resize:vertical;font-family:inherit;",
+      placeholder: "Ein Name pro Zeile …\nz. B.\nAnna Meier\nBen Schulz\nClara Vogel",
+    });
+    textarea.value = state.bulkText;
+    textarea.addEventListener("input", (e) => { state.bulkText = e.target.value; });
+    wrap.appendChild(textarea);
+
+    const addRow = el("div", { class: "add-row", style: "margin-top:10px" });
+    const addBtn = el("button", { class: "btn-primary-sm", onClick: () => { addBulkStudents(); } }, "+ Alle hinzufügen");
+    addRow.appendChild(addBtn);
+    wrap.appendChild(addRow);
+    wrap.appendChild(el("div", { class: "control-hint", style: "margin-top:6px" }, "Alle bekommen erstmal Skill-Level 3 — danach einzeln anpassbar."));
+  } else {
+    const addRow = el("div", { class: "add-row" });
+    const nameInput = el("input", { class: "text-input", placeholder: "Name eintragen …", value: state.newName });
+    nameInput.addEventListener("input", (e) => { state.newName = e.target.value; });
+    nameInput.addEventListener("keydown", (e) => { if (e.key === "Enter") addStudent(); });
+    addRow.appendChild(nameInput);
+    addRow.appendChild(starsEl(state.newSkill, 15, (n) => { state.newSkill = n; render(); setTimeout(() => nameInput.focus(), 0); }));
+    addRow.appendChild(el("button", { class: "btn-primary-sm", onClick: addStudent }, "+ Hinzufügen"));
+    wrap.appendChild(addRow);
+  }
 
   if (activeClass.students.length === 0) {
     wrap.appendChild(el("div", { class: "empty-roster" }, "Noch keine Schüler:innen eingetragen."));
@@ -437,14 +749,32 @@ function renderGenerateView(activeClass) {
 
   const panel = el("div", { class: "control-panel" });
 
-  const teamsGroup = el("div", {}, [
-    el("label", { class: "control-label" }, "Anzahl Teams"),
-    el("div", { class: "stepper" }, [
-      el("button", { class: "stepper-btn", onClick: () => { state.numTeams = Math.max(2, state.numTeams - 1); render(); } }, "−"),
-      el("span", { class: "stepper-value" }, String(state.numTeams)),
-      el("button", { class: "stepper-btn", onClick: () => { state.numTeams = Math.min(6, state.numTeams + 1); render(); } }, "+"),
+  const sizeModeGroup = el("div", {}, [
+    el("label", { class: "control-label" }, "Einstellen nach"),
+    el("div", { class: "mode-row" }, [
+      el("button", { class: "mode-btn" + (state.sizeMode === "teams" ? " active" : ""), onClick: () => { state.sizeMode = "teams"; render(); } }, "Anzahl Teams"),
+      el("button", { class: "mode-btn" + (state.sizeMode === "perTeam" ? " active" : ""), onClick: () => { state.sizeMode = "perTeam"; render(); } }, "Spieler pro Team"),
     ]),
   ]);
+  panel.appendChild(sizeModeGroup);
+
+  const teamsGroup = state.sizeMode === "teams"
+    ? el("div", {}, [
+        el("label", { class: "control-label" }, "Anzahl Teams"),
+        el("div", { class: "stepper" }, [
+          el("button", { class: "stepper-btn", onClick: () => { state.numTeams = Math.max(2, state.numTeams - 1); render(); } }, "−"),
+          el("span", { class: "stepper-value" }, String(state.numTeams)),
+          el("button", { class: "stepper-btn", onClick: () => { state.numTeams = state.numTeams + 1; render(); } }, "+"),
+        ]),
+      ])
+    : el("div", {}, [
+        el("label", { class: "control-label" }, "Spieler pro Team"),
+        el("div", { class: "stepper" }, [
+          el("button", { class: "stepper-btn", onClick: () => { state.studentsPerTeam = Math.max(2, state.studentsPerTeam - 1); render(); } }, "−"),
+          el("span", { class: "stepper-value" }, String(state.studentsPerTeam)),
+          el("button", { class: "stepper-btn", onClick: () => { state.studentsPerTeam = Math.min(20, state.studentsPerTeam + 1); render(); } }, "+"),
+        ]),
+      ]);
   panel.appendChild(teamsGroup);
 
   const modeGroup = el("div", {}, [
@@ -463,21 +793,36 @@ function renderGenerateView(activeClass) {
 
   panel.appendChild(el("div", { class: "control-hint" },
     `${activeCount} von ${activeClass.students.length} dabei` +
-    (activeClass.students.length > 0 && activeCount !== activeClass.students.length ? ` — Anwesenheit im Reiter "Schüler:innen" anpassen` : "")
+    (activeClass.students.length > 0 && activeCount !== activeClass.students.length ? ` — Anwesenheit im Reiter "Schüler:innen" anpassen` : "") +
+    (state.sizeMode === "perTeam" && activeCount > 0 ? ` · ergibt ${Math.max(2, Math.ceil(activeCount / state.studentsPerTeam))} Teams` : "")
   ));
 
   wrap.appendChild(panel);
 
   if (state.teams) {
+    if (state.teamsWarning) {
+      wrap.appendChild(el("div", { class: "control-hint", style: "color:#E8A798;margin-bottom:8px" }, `⚠️ ${state.teamsWarning}`));
+    }
     wrap.appendChild(el("div", { class: "drag-hint" }, "Tippen, halten und auf ein anderes Team ziehen, um zu verschieben."));
     const grid = el("div", { class: "teams-grid" });
     state.teams.forEach(team => {
-      const c = LEIBCHEN[team.id % LEIBCHEN.length];
-      const card = el("div", { class: "team-card", "data-team-id": String(team.id), style: `background:${c.bgSoft};border-color:${c.bg}` });
-      const head = el("div", { class: "team-header", style: `background:${c.bg};color:${c.text}` }, [
-        document.createTextNode(`Team ${c.name}`),
-        el("span", { class: "team-count" }, String(team.students.length)),
-      ]);
+      const card = el("div", { class: "team-card", "data-team-id": String(team.id) });
+      const head = el("div", { class: "team-header" });
+      const nameGroup = el("div", { style: "display:flex;align-items:center;gap:4px;min-width:0" });
+      if (state.editingTeamId === team.id) {
+        const input = el("input", { class: "class-name-input", style: "font-size:14px;padding:2px 6px;width:100px", value: team.name });
+        input.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") { renameTeam(team.id, input.value); state.editingTeamId = null; render(); }
+        });
+        nameGroup.appendChild(input);
+        nameGroup.appendChild(el("button", { class: "icon-btn", style: "color:inherit", onClick: () => { renameTeam(team.id, input.value); state.editingTeamId = null; render(); } }, "✓"));
+        setTimeout(() => input.focus(), 0);
+      } else {
+        nameGroup.appendChild(el("span", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, team.name));
+        nameGroup.appendChild(el("button", { class: "icon-btn", style: "color:inherit", onClick: () => { state.editingTeamId = team.id; render(); } }, "✎"));
+      }
+      head.appendChild(nameGroup);
+      head.appendChild(el("span", { class: "team-count" }, String(team.students.length)));
       card.appendChild(head);
       const body = el("div", { class: "team-body" });
       if (team.students.length === 0) {
@@ -502,6 +847,295 @@ function renderGenerateView(activeClass) {
   return wrap;
 }
 
+function renderRulesView(activeClass) {
+  const wrap = el("div", { class: "content" });
+  if (!activeClass.rules) activeClass.rules = { together: [], apart: [] };
+  const students = activeClass.students;
+
+  function nameOf(id) {
+    const s = students.find(s => s.id === id);
+    return s ? s.name : "?";
+  }
+
+  function section(title, type, emptyHint, symbol) {
+    const box = el("div", { class: "control-panel" });
+    box.appendChild(el("label", { class: "control-label" }, title));
+
+    if (students.length < 2) {
+      box.appendChild(el("div", { class: "empty-roster" }, "Trag zuerst mindestens zwei Schüler:innen ein."));
+      return box;
+    }
+
+    const selA = el("select", { class: "text-input" });
+    const selB = el("select", { class: "text-input" });
+    [selA, selB].forEach(sel => {
+      sel.appendChild(el("option", { value: "" }, "Schüler:in wählen …"));
+      students.forEach(s => sel.appendChild(el("option", { value: s.id }, s.name)));
+    });
+    const row = el("div", { class: "add-row" }, [
+      selA,
+      selB,
+      el("button", { class: "btn-primary-sm", onClick: () => addRule(type, selA.value, selB.value) }, "+ Hinzufügen"),
+    ]);
+    box.appendChild(row);
+
+    const list = activeClass.rules[type];
+    if (list.length === 0) {
+      box.appendChild(el("div", { class: "empty-roster" }, emptyHint));
+    } else {
+      const listWrap = el("div", { class: "roster-list" });
+      list.forEach(([a, b], idx) => {
+        const rowEl = el("div", { class: "roster-row" });
+        rowEl.appendChild(el("span", { class: "roster-name" }, `${nameOf(a)}  ${symbol}  ${nameOf(b)}`));
+        rowEl.appendChild(el("button", { class: "icon-btn", onClick: () => removeRule(type, idx) }, "✕"));
+        listWrap.appendChild(rowEl);
+      });
+      box.appendChild(listWrap);
+    }
+    return box;
+  }
+
+  wrap.appendChild(section("🤝 Immer zusammen", "together", "Noch keine Regel — z. B. wenn zwei sich gut ergänzen sollen.", "🤝"));
+  wrap.appendChild(section("🚫 Nie zusammen", "apart", "Noch keine Regel — z. B. um Streit zu vermeiden.", "🚫"));
+
+  return wrap;
+}
+
+function renderPickView(activeClass) {
+  const wrap = el("div", { class: "content" });
+  const present = activeClass.students.filter(s => !state.excluded[s.id]);
+
+  const panel = el("div", { class: "control-panel" });
+  panel.appendChild(el("div", {}, [
+    el("label", { class: "control-label" }, "Wie viele auswählen"),
+    el("div", { class: "stepper" }, [
+      el("button", { class: "stepper-btn", onClick: () => { state.pickCount = Math.max(1, state.pickCount - 1); render(); } }, "−"),
+      el("span", { class: "stepper-value" }, String(state.pickCount)),
+      el("button", { class: "stepper-btn", onClick: () => { state.pickCount = Math.min(Math.max(present.length, 1), state.pickCount + 1); render(); } }, "+"),
+    ]),
+  ]));
+
+  panel.appendChild(el("div", { class: "mode-row" }, [
+    el("button", {
+      class: "mode-btn" + (state.pickNoRepeat ? " active" : ""),
+      onClick: () => { state.pickNoRepeat = !state.pickNoRepeat; render(); },
+    }, state.pickNoRepeat ? "✓ Ohne Wiederholung, bis alle dran waren" : "Wiederholung möglich"),
+  ]));
+
+  const btnRow = el("div", { class: "add-row" });
+  const pickBtn = el("button", { class: "btn-primary", onClick: pickRandom }, "🎲 Auswählen");
+  if (present.length === 0) pickBtn.setAttribute("disabled", "disabled");
+  btnRow.appendChild(pickBtn);
+  if (state.pickNoRepeat) {
+    btnRow.appendChild(el("button", { class: "btn-primary-sm", onClick: resetPicked }, "↺ Zurücksetzen"));
+  }
+  panel.appendChild(btnRow);
+
+  const remaining = present.filter(s => !state.pickedIds[s.id]).length;
+  panel.appendChild(el("div", { class: "control-hint" },
+    `${present.length} anwesend` + (state.pickNoRepeat ? ` · ${remaining} noch nicht dran gewesen` : "")
+  ));
+
+  wrap.appendChild(panel);
+
+  if (state.pickResult && state.pickResult.length > 0) {
+    const card = el("div", { class: "team-card", style: "max-width:340px" });
+    card.appendChild(el("div", { class: "team-header" }, [
+      document.createTextNode("Ausgewählt"),
+      el("span", { class: "team-count" }, String(state.pickResult.length)),
+    ]));
+    const body = el("div", { class: "team-body" });
+    state.pickResult.forEach(s => {
+      body.appendChild(el("div", { class: "student-chip" }, el("span", {}, s.name)));
+    });
+    card.appendChild(body);
+    wrap.appendChild(card);
+  }
+
+  return wrap;
+}
+
+function renderTournamentView(activeClass) {
+  const wrap = el("div", { class: "content" });
+
+  if (!state.teams || state.teams.length < 2) {
+    wrap.appendChild(el("div", { class: "empty-roster" }, `Bilde zuerst unter "Teams bilden" mindestens 2 Teams, bevor du ein Turnier startest.`));
+    return wrap;
+  }
+
+  const t = activeClass.tournament;
+  const names = t ? t.teamNames : Object.fromEntries(state.teams.map(x => [x.id, x.name]));
+  function label(id) { return (names && names[id]) || `Team ${id + 1}`; }
+
+  function matchRow(m, requireWinner) {
+    const row = el("div", { class: "roster-row" });
+    if (m.bye) {
+      row.appendChild(el("span", { class: "roster-name" }, `${label(m.teamA)} — Freilos`));
+      return row;
+    }
+    const inner = el("div", { style: "display:flex;flex-direction:column;gap:8px;flex:1" });
+    inner.appendChild(el("span", { class: "roster-name" }, `${label(m.teamA)}  vs  ${label(m.teamB)}`));
+
+    const scoreRow = el("div", { style: "display:flex;align-items:center;gap:8px" });
+    const inputA = el("input", {
+      type: "number", min: "0", inputmode: "numeric", class: "text-input",
+      style: "width:60px;text-align:center;padding:8px;flex:none",
+      value: m.scoreA !== null && m.scoreA !== undefined ? String(m.scoreA) : "",
+      placeholder: "–",
+    });
+    inputA.addEventListener("change", (e) => {
+      const v = e.target.value === "" ? null : parseInt(e.target.value, 10);
+      m.scoreA = (v === null || isNaN(v)) ? null : v;
+      updateWinnerFromScore(m);
+      saveState(); render();
+    });
+    const sep = el("span", { style: "color:var(--muted)" }, ":");
+    const inputB = el("input", {
+      type: "number", min: "0", inputmode: "numeric", class: "text-input",
+      style: "width:60px;text-align:center;padding:8px;flex:none",
+      value: m.scoreB !== null && m.scoreB !== undefined ? String(m.scoreB) : "",
+      placeholder: "–",
+    });
+    inputB.addEventListener("change", (e) => {
+      const v = e.target.value === "" ? null : parseInt(e.target.value, 10);
+      m.scoreB = (v === null || isNaN(v)) ? null : v;
+      updateWinnerFromScore(m);
+      saveState(); render();
+    });
+    scoreRow.appendChild(inputA);
+    scoreRow.appendChild(sep);
+    scoreRow.appendChild(inputB);
+    inner.appendChild(scoreRow);
+
+    const bothEntered = m.scoreA !== null && m.scoreA !== undefined && m.scoreB !== null && m.scoreB !== undefined;
+    if (bothEntered) {
+      if (m.scoreA === m.scoreB) {
+        if (requireWinner) {
+          inner.appendChild(el("div", { class: "control-hint", style: "color:#E8A798" }, "Unentschieden — wer kommt weiter?"));
+          inner.appendChild(el("div", { class: "mode-row" }, [
+            el("button", { class: "mode-btn" + (m.winner === m.teamA ? " active" : ""), onClick: () => { m.winner = m.teamA; saveState(); render(); } }, label(m.teamA)),
+            el("button", { class: "mode-btn" + (m.winner === m.teamB ? " active" : ""), onClick: () => { m.winner = m.teamB; saveState(); render(); } }, label(m.teamB)),
+          ]));
+        } else {
+          inner.appendChild(el("div", { class: "control-hint" }, "Unentschieden"));
+        }
+      } else {
+        inner.appendChild(el("div", { class: "control-hint" }, `Sieger: ${label(m.winner)}`));
+      }
+    }
+    row.appendChild(inner);
+    return row;
+  }
+
+  function standingsTable(teamIds, rounds) {
+    const table = el("div", { class: "roster-list" });
+    computeStandings(teamIds, rounds).forEach((s, idx) => {
+      const r = el("div", { class: "roster-row" });
+      r.appendChild(el("span", { class: "roster-name" }, `${idx + 1}. ${label(s.id)}`));
+      const info = el("div", { style: "display:flex;flex-direction:column;align-items:flex-end;gap:2px" });
+      info.appendChild(el("span", { class: "chip-btn" }, `${s.points} Pkt`));
+      info.appendChild(el("span", { class: "control-hint" }, `${s.wins}S ${s.draws}U ${s.losses}N · Tore ${s.gf}:${s.ga}`));
+      r.appendChild(info);
+      table.appendChild(r);
+    });
+    return table;
+  }
+
+  function knockoutBlock(koRounds, title) {
+    const box = el("div", { class: "control-panel" });
+    box.appendChild(el("label", { class: "control-label" }, title));
+    koRounds.forEach((round, ridx) => {
+      box.appendChild(el("div", { class: "control-hint" }, `Runde ${ridx + 1}`));
+      const list = el("div", { class: "roster-list" });
+      round.forEach(m => list.appendChild(matchRow(m, true)));
+      box.appendChild(list);
+    });
+    const last = koRounds[koRounds.length - 1];
+    const allDecided = last.every(m => m.winner !== null && m.winner !== undefined);
+    if (allDecided && last.length > 1) {
+      box.appendChild(el("button", {
+        class: "btn-primary-sm",
+        onClick: () => { tryAdvanceKnockout(koRounds); saveState(); render(); },
+      }, "Nächste Runde erstellen"));
+    } else if (allDecided && last.length === 1) {
+      box.appendChild(el("div", { class: "empty-roster", style: "color:#D9A427;font-weight:600" }, `🏆 Champion: ${label(last[0].winner)}`));
+    }
+    return box;
+  }
+
+  if (!t) {
+    const panel = el("div", { class: "control-panel" });
+    panel.appendChild(el("div", {}, [
+      el("label", { class: "control-label" }, "Format"),
+      el("div", { class: "mode-row" }, [
+        el("button", { class: "mode-btn" + (state.tourFormat === "roundrobin" ? " active" : ""), onClick: () => { state.tourFormat = "roundrobin"; render(); } }, "Jeder gegen jeden"),
+        el("button", { class: "mode-btn" + (state.tourFormat === "knockout" ? " active" : ""), onClick: () => { state.tourFormat = "knockout"; render(); } }, "K.-o.-System"),
+        el("button", { class: "mode-btn" + (state.tourFormat === "groups" ? " active" : ""), onClick: () => { state.tourFormat = "groups"; render(); } }, "Gruppen + K.-o."),
+      ]),
+    ]));
+    panel.appendChild(el("div", {}, [
+      el("label", { class: "control-label" }, "Gleichzeitige Spielfelder"),
+      el("div", { class: "stepper" }, [
+        el("button", { class: "stepper-btn", onClick: () => { state.tourFields = Math.max(1, state.tourFields - 1); render(); } }, "−"),
+        el("span", { class: "stepper-value" }, String(state.tourFields)),
+        el("button", { class: "stepper-btn", onClick: () => { state.tourFields = Math.min(10, state.tourFields + 1); render(); } }, "+"),
+      ]),
+    ]));
+    if (state.tourFormat === "groups" && state.teams.length < 4) {
+      panel.appendChild(el("div", { class: "control-hint", style: "color:#E8A798" }, "Für Gruppen + K.-o. sind mindestens 4 Teams empfehlenswert."));
+    }
+    panel.appendChild(el("button", { class: "btn-primary", onClick: startTournament }, "🏆 Turnier erstellen"));
+    panel.appendChild(el("div", { class: "control-hint" }, `Aktuelle Teams: ${state.teams.length}`));
+    wrap.appendChild(panel);
+    return wrap;
+  }
+
+  wrap.appendChild(el("div", { class: "add-row" }, [
+    el("button", { class: "chip-btn", onClick: resetTournament }, "↺ Neues Turnier"),
+  ]));
+
+  if (t.format === "roundrobin") {
+    t.rounds.forEach((round, ridx) => {
+      const box = el("div", { class: "control-panel" });
+      box.appendChild(el("label", { class: "control-label" }, `Runde ${ridx + 1}`));
+      const list = el("div", { class: "roster-list" });
+      round.forEach(m => list.appendChild(matchRow(m)));
+      box.appendChild(list);
+      wrap.appendChild(box);
+    });
+    const standingsBox = el("div", { class: "control-panel" });
+    standingsBox.appendChild(el("label", { class: "control-label" }, "🏆 Tabelle"));
+    standingsBox.appendChild(standingsTable(t.teamIds, t.rounds));
+    wrap.appendChild(standingsBox);
+  } else if (t.format === "knockout") {
+    wrap.appendChild(knockoutBlock(t.koRounds, "K.-o.-Runde"));
+  } else if (t.format === "groups") {
+    t.groups.forEach((g, gi) => {
+      const box = el("div", { class: "control-panel" });
+      box.appendChild(el("label", { class: "control-label" }, `Gruppe ${gi === 0 ? "A" : "B"}`));
+      g.rounds.forEach((round, ridx) => {
+        box.appendChild(el("div", { class: "control-hint" }, `Runde ${ridx + 1}`));
+        const list = el("div", { class: "roster-list" });
+        round.forEach(m => list.appendChild(matchRow(m)));
+        box.appendChild(list);
+      });
+      box.appendChild(el("div", { class: "control-hint" }, "Tabelle"));
+      box.appendChild(standingsTable(g.teamIds, g.rounds));
+      wrap.appendChild(box);
+    });
+
+    const allGroupsDone = t.groups.every(g => g.rounds.every(r => r.every(m => m.winner !== null && m.winner !== undefined)));
+    if (allGroupsDone && !t.koFromGroups) {
+      wrap.appendChild(el("button", { class: "btn-primary", onClick: startKnockoutFromGroups }, "🏆 Zur K.-o.-Runde"));
+    }
+    if (t.koFromGroups) {
+      wrap.appendChild(knockoutBlock(t.koFromGroups, "🏆 K.-o.-Runde"));
+    }
+  }
+
+  return wrap;
+}
+
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = "";
@@ -513,7 +1147,13 @@ function render() {
     return;
   }
   app.appendChild(renderSubHeader(activeClass));
-  app.appendChild(state.view === "roster" ? renderRosterView(activeClass) : renderGenerateView(activeClass));
+  let viewNode;
+  if (state.view === "roster") viewNode = renderRosterView(activeClass);
+  else if (state.view === "rules") viewNode = renderRulesView(activeClass);
+  else if (state.view === "pick") viewNode = renderPickView(activeClass);
+  else if (state.view === "tournament") viewNode = renderTournamentView(activeClass);
+  else viewNode = renderGenerateView(activeClass);
+  app.appendChild(viewNode);
 }
 
 loadState();
